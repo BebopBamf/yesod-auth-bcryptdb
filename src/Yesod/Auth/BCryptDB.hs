@@ -4,6 +4,8 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE QuasiQuotes       #-}
 {-# LANGUAGE TypeFamilies      #-}
+{-# LANGUAGE RankNTypes #-}
+{-# LANGUAGE ScopedTypeVariables        #-}
 -------------------------------------------------------------------------------
 -- |
 -- Module      :  Yesod.Auth.BCryptDB
@@ -143,32 +145,75 @@
 module Yesod.Auth.BCryptDB
   ( BCryptDBUser(..)
   , setPassword
-  , setPasswordWithHashingPolicy
+  , setPasswordStrength
   -- * Interface to database and Yesod.Auth
   , authBCryptDB
   , authBCryptDBWithForm
   , submitRouteBcryptDB
-  , validateCreds
+  , validatePass
   ) where
 
 #if __GLASGOW_HASKELL__ < 710
 import Control.Applicative                   ((<$>), (<*>), pure)
 #endif
-import Crypto.BCrypt
+import Crypto.KDF.BCrypt ( hashPassword, validatePassword )
 import Data.Aeson                            ((.:?))
-import qualified Data.ByteString.Char8 as BS (pack, unpack)
-import Data.Text                             (Text, pack, unpack)
+import Data.Text                             (Text, unpack, pack)
 import Data.Maybe                            (fromMaybe)
 import Yesod.Auth
+    ( loginErrorMessageI,
+      setCredsRedirect,
+      Route(LoginR, PluginR),
+      AuthPlugin(AuthPlugin),
+      AuthHandler,
+      Creds(Creds),
+      YesodAuth,
+      AuthRoute,
+      YesodAuthPersist(AuthEntity) )
+import qualified Yesod.Auth.Message as Msg
 import Yesod.Core
-import Yesod.Form
+    ( getRouteToParent,
+      defaultCsrfParamName,
+      hamlet,
+      getRequest,
+      notFound,
+      sendResponse,
+      requireInsecureJsonBody,
+      simpleContentType,
+      lookupHeader,
+      YesodRequest(reqToken),
+      ToWidget(toWidget),
+      WidgetFor,
+      Yesod,
+      MonadHandler(liftHandler),
+      TypedContent,
+      HandlerFor,
+      Value(Object),
+      MonadIO(..),
+      FromJSON(parseJSON) )
+import Yesod.Form ( textField, iopt, runInputPost )
 import Yesod.Persist
-import Yesod.Auth.Message                    (AuthMessage(InvalidUsernamePass))
+    ( Entity(entityVal),
+      PersistEntity(PersistEntityBackend, Unique),
+      PersistUnique,
+      PersistUniqueRead(getBy),
+      YesodPersist(runDB, YesodPersistBackend),
+      HasPersistBackend(BaseBackend) )
+import qualified Data.ByteString.Char8 as BS
 
-#if !MIN_VERSION_yesod_core(1,4,14)
-defaultCsrfParamName :: Text
-defaultCsrfParamName = "_token"
+#if !MIN_VERSION_yesod_core(1,6,0)
+type HandlerFor site a = HandlerT site IO a
+type WidgetFor site a  = WidgetT site IO ()
+#define liftHandler lift
 #endif
+
+#if !MIN_VERSION_yesod_core(1,6,11)
+#define requireInsecureJsonBody requireJsonBody
+#endif
+
+-- | Default strength used for passwords.
+defaultStrength :: Int
+defaultStrength = 10
 
 -- | The type representing user information stored in the database should
 --   be an instance of this class.  It just provides the getter and setter
@@ -177,7 +222,7 @@ class BCryptDBUser user where
   -- | Setter used by 'setPassword' and 'upgradePasswordHash'.  Produces a
   --   version of the user data with the hash set to the new value.
   --
-  setPasswordSaltedHash
+  setPasswordBCryptHash
     :: Text -- ^ Password hash
     -> user
     -> user
@@ -185,62 +230,59 @@ class BCryptDBUser user where
   -- | Getter used by 'validatePass' and 'upgradePasswordHash' to
   --   retrieve the password hash from user data
   --
-  userPasswordSaltedHash :: user -> Maybe Text
+  userPasswordBCryptHash :: user -> Maybe Text
 
-  {-# MINIMAL setPasswordSaltedHash, userPasswordSaltedHash #-}
+  {-# MINIMAL setPasswordBCryptHash, userPasswordBCryptHash #-}
 
--- | Calculate salted hash using Bcrypt.
-saltAndHashPassword :: Text -> HashingPolicy -> IO (Maybe Text)
-saltAndHashPassword password hashingPolicy = do
-   hash <- hashPasswordUsingPolicy hashingPolicy . BS.pack $ unpack password
-   return $ pack . BS.unpack <$> hash
-
--- | Set password for user. This function should be used for setting
---   passwords. It generates random salt and calculates proper hashes.
-setPassword
-  :: BCryptDBUser user
-  => Text          -- ^ Password
-  -> user
-  -> IO user
-setPassword = setPasswordWithHashingPolicy slowerBcryptHashingPolicy
+-- | Calculate a password hash using "Crypto.KDF.BCrypt".
+passwordHash :: MonadIO m => Int -> Text -> m Text
+passwordHash strength pwd = do
+    h <- liftIO $ hashPassword strength (BS.pack $ unpack pwd)
+    return $ pack $ BS.unpack h
 
 -- | Set password for user. This function should be used for setting passwords
--- with an specified hashing policy. It generates random salt and calculates
+-- with an specified hash strength. It generates random salt and calculates
 -- proper hashes.
-setPasswordWithHashingPolicy
-  :: BCryptDBUser user
-  => HashingPolicy
-  -> Text          -- ^ Password
-  -> user
-  -> IO user
-setPasswordWithHashingPolicy hashingPolicy password user = do
-    mHash <- saltAndHashPassword password hashingPolicy
-    return $ case mHash of
-                  Nothing   -> user
-                  Just hash -> setPasswordSaltedHash hash user
+setPasswordStrength :: (MonadIO m, BCryptDBUser user) => Int -> Text -> user -> m user
+setPasswordStrength strength pwd u = do
+    hashed <- passwordHash strength pwd
+    return $ setPasswordBCryptHash hashed u
+
+-- | As 'setPasswordStrength', but using the 'defaultStrength'
+setPassword :: (MonadIO m, BCryptDBUser user) => Text -> user -> m user
+setPassword = setPasswordStrength defaultStrength
 
 ----------------------------------------------------------------
 -- Authentication
 ----------------------------------------------------------------
 
--- | Given a user ID and password in plain text, validate them against
---   the database values.
-validateCreds
-  :: BCryptDBPersist master user
-  => Unique user                 -- ^ User unique identifier
-  -> Text                        -- ^ Password given
-  -> HandlerT master IO Bool
-validateCreds userID password = do
-  -- Checks that hash and password match
-  mUser <- runDB $ getBy userID
+-- | Validate a plaintext password against the hash in the user data structure.
+--
+--   The result distinguishes two types of validation failure, which may
+--   be useful in an application which supports multiple authentication
+--   methods:
+--
+--   * Just False - the user has a password set up, but the given one does
+--     not match it
+--
+--   * Nothing - the user does not have a password ('userPasswordHash' returns
+--     Nothing)
+--
+--   Since 1.4.1
+--
+validatePass :: BCryptDBUser u => u -> Text -> Maybe Bool
+validatePass user passwd = do
+    hash <- userPasswordBCryptHash user
+    -- NB plaintext password characters are truncated to 8 bits here,
+    -- and also in passwordHash above (the hash is already 8 bit).
+    -- This is for historical compatibility, but in practice it is
+    -- unlikely to reduce the entropy of most users' alphabets by much.
+    let hash' = BS.pack $ unpack hash
+        passwd' = BS.pack $ unpack passwd
 
-  return $ case userPasswordSaltedHash . entityVal =<< mUser of
-                Nothing -> False
+    return $ validatePassword passwd' hash'
 
-                Just storedPassword ->
-                  validatePassword
-                    (BS.pack $ unpack storedPassword)
-                    (BS.pack $ unpack password)
+
 
 ----------------------------------------------------------------
 -- Interface to database and Yesod.Auth
@@ -268,39 +310,50 @@ instance FromJSON UserPass where
   parseJSON (Object v) = UserPass <$> v .:? "username" <*> v .:? "password"
   parseJSON _          = pure $ UserPass Nothing Nothing
 
+-- | Given a user ID and password in plaintext, validate them against
+--   the database values.  This function simply looks up the user id in the
+--   database and calls 'validatePass' to do the work.
+--
+validateUser :: BCryptDBPersist site user =>
+                Unique user     -- ^ User unique identifier
+             -> Text            -- ^ Password in plaintext
+             -> HandlerFor site Bool
+validateUser userID passwd = do
+    -- Get user data
+    user <- runDB $ getBy userID
+    return $ fromMaybe False $ flip validatePass passwd . entityVal =<< user
+
 login :: AuthRoute
 login = PluginR "bcryptdb" ["login"]
 
 -- | Handle the login form. First parameter is function which maps
 --   username (whatever it might be) to unique user ID.
-postLoginR
-  :: BCryptDBPersist master user
-  => (Text -> Maybe (Unique user))
-  -> HandlerT Auth (HandlerT master IO) TypedContent
+postLoginR :: BCryptDBPersist site user =>
+              (Text -> Maybe (Unique user))
+           -> AuthHandler site TypedContent
 postLoginR uniq = do
-  jsonContent <- fmap ((== "application/json") . simpleContentType)
-             <$> lookupHeader "Content-Type"
-
-  UserPass mUser mPass <-
+  ct <- lookupHeader "Content-Type"
+  let jsonContent = (== "application/json") . simpleContentType <$> ct
+  UserPass mu mp <-
       case jsonContent of
-           Just True -> requireJsonBody
-           _         -> lift . runInputPost $ UserPass
-                          <$> iopt textField "username"
-                          <*> iopt textField "password"
+          Just True -> requireInsecureJsonBody  -- We already know content type!
+          _         -> liftHandler $ runInputPost $ UserPass
+                       <$> iopt textField "username"
+                       <*> iopt textField "password"
 
-  isValid <- lift . fromMaybe (return False)
-                  $ validateCreds <$> (uniq =<< mUser) <*> mPass
+  isValid <- liftHandler $ fromMaybe (return False) 
+              (validateUser <$> (uniq =<< mu) <*> mp)
+  if isValid 
+      then liftHandler $ setCredsRedirect $ Creds "bcryptdb" (fromMaybe "" mu) []
+      else loginErrorMessageI LoginR Msg.InvalidUsernamePass
 
-  if isValid
-      then lift . setCredsRedirect $ Creds "bcryptdb" (fromMaybe "" mUser) []
-      else loginErrorMessageI LoginR InvalidUsernamePass
 
 -- | Prompt for username and password, validate that against a database
 --   which holds the username and a salted hash of the password
 authBCryptDB
-  :: BCryptDBPersist master user
+  :: BCryptDBPersist site user
   => (Text -> Maybe (Unique user))
-  -> AuthPlugin master
+  -> AuthPlugin site
 authBCryptDB = authBCryptDBWithForm defaultForm
 
 -- | Like 'authBCryptDB', but with an extra parameter to supply a custom HTML
@@ -313,18 +366,19 @@ authBCryptDB = authBCryptDBWithForm defaultForm
 --
 -- Please see the example in the documentation at the head of this module.
 --
-authBCryptDBWithForm
-  :: BCryptDBPersist master user
-  => (Route master -> WidgetT master IO ())
-  -> (Text -> Maybe (Unique user))
-  -> AuthPlugin master
+authBCryptDBWithForm :: forall site user.
+                      BCryptDBPersist site user =>
+                      (Route site -> WidgetFor site ())
+                   -> (Text -> Maybe (Unique user))
+                   -> AuthPlugin site
 authBCryptDBWithForm form uniq =
   AuthPlugin "bcryptdb" dispatch $ \tm -> form (tm login)
   where
-    dispatch "POST" ["login"] = postLoginR uniq >>= sendResponse
-    dispatch _ _              = notFound
+        dispatch :: Text -> [Text] -> AuthHandler site TypedContent
+        dispatch "POST" ["login"] = postLoginR uniq >>= sendResponse
+        dispatch _ _              = notFound
 
-defaultForm :: Yesod app => Route app -> WidgetT app IO ()
+defaultForm :: Yesod app => Route app -> WidgetFor app ()
 defaultForm loginRoute = do
   request <- getRequest
   let mtok = reqToken request
@@ -365,7 +419,7 @@ defaultForm loginRoute = do
 --
 submitRouteBcryptDB
   :: YesodAuth site
-  => HandlerT Auth (HandlerT site IO) (Route site)
+  => AuthHandler site (Route site)
 submitRouteBcryptDB = do
     toParent <- getRouteToParent
     return $ toParent login
